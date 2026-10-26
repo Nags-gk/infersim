@@ -26,6 +26,7 @@ from .models import ModelConfig
 from .models import preset as get_model
 from .ops import PRECISIONS, Op, Precision, StepShape, step_ops
 from .roofline import OpTiming, allreduce_time, p2p_time, time_op
+from .stack import STACKS, Stack
 
 
 @dataclass
@@ -43,7 +44,8 @@ class StepResult:
             k = getattr(t.op, key) if key == "category" else t.bound
             out[k] = out.get(k, 0.0) + t.total_s
         for k, v in self.extra_s.items():
-            out[k if key == "category" else "comm"] = out.get(k if key == "category" else "comm", 0.0) + v
+            name = k if key == "category" else ("overhead" if k == "overlap" else "comm")
+            out[name] = out.get(name, 0.0) + v
         return out
 
     def bottleneck(self) -> dict:
@@ -73,12 +75,15 @@ class GPUDeployment:
     pp: int = 1
     precision: str | Precision = "bf16"
     expert_parallel: bool = False
+    stack: str | Stack = "fused"
 
     def __post_init__(self) -> None:
         if isinstance(self.model, str):
             self.model = get_model(self.model)
         if isinstance(self.hw, str):
             self.hw = get_hw(self.hw)
+        if isinstance(self.stack, str):
+            self.stack = STACKS[self.stack]
         self.prec = _prec(self.precision)
         if self.model.layers % self.pp:
             # uneven stages are allowed; the slowest stage sets the interval
@@ -110,10 +115,15 @@ class GPUDeployment:
 
     def step(self, step: StepShape) -> StepResult:
         ops = step_ops(self.model, step, self.tp, self.prec, self.hw.tile_m, self.hw.tile_n,
-                       self.expert_parallel)
-        timings = [time_op(o, self.hw) for o in ops]
+                       self.expert_parallel, self.stack)
+        timings = [time_op(o, self.hw, self.stack.kernel_multiplier) for o in ops]
         total = sum(t.total_s for t in timings)
         extra = {}
+        if self.stack.async_launch:
+            # host enqueues kernels while the GPU runs earlier ones: the slower side sets the pace
+            host = sum(t.overhead_s * t.op.count for t in timings)
+            device = total - host
+            extra["overlap"] = max(host, device) - (host + device)
         if self.pp > 1:
             hop = p2p_time(step.tokens * self.model.hidden * self.prec.ab, self.hw.link_bw, self.hw.link_latency)
             extra["comm"] = (self.pp - 1) * hop

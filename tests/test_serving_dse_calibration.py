@@ -90,16 +90,35 @@ def test_calibration_recovers_known_parameters():
 
 
 def test_report_from_measure_folder(tmp_path):
-    truth = get("t4").with_overrides(eff_compute=0.5, eff_memory=0.7, launch_overhead=12e-6)
+    from infersim.stack import STACKS
+    hw_truth = get("t4").with_overrides(eff_compute=0.5, eff_memory=0.7, launch_overhead=12e-6)
+    m0 = cal.Measurement("qwen2.5-0.5b", "decode", 1, 256, 1.0)
+    mult = 700 / cal.model_kernels(m0)  # the stack's multiplier comes from the kernel counts below
+    truth = cal.Setup(hw_truth, STACKS["eager"].with_overrides(kernel_multiplier=mult, math_passes=2.5, score_passes=6.0))
     ms = _synthetic(truth)
     (tmp_path / "steps.csv").write_text(
         "model,phase,batch,tokens,measured_s,precision\n"
         + "".join(f"{m.model},{m.phase},{m.batch},{m.tokens},{m.measured_s},fp16\n" for m in ms))
     gem = [cal.GemmMeasurement(m, 4864, 896, 1.0) for m in (1, 64, 512)]
     (tmp_path / "gemm.csv").write_text(
-        "m,n,k,measured_s,tflops\n" + "".join(f"{g.m},{g.n},{g.k},{cal.predict_gemm(g, truth)},0\n" for g in gem))
+        "m,n,k,measured_s,tflops\n" + "".join(f"{g.m},{g.n},{g.k},{cal.predict_gemm(g, hw_truth)},0\n" for g in gem))
     (tmp_path / "kernels.csv").write_text("model,phase,batch,tokens,cuda_kernels\nqwen2.5-0.5b,decode,1,256,700\n")
     r = cal.report_from_path(str(tmp_path), get("t4"))
     assert r["mape_holdout_after"] < 1.0 and r["gemm"]["mape_after"] < 2.0
     assert r["kernels"][0]["measured"] == 700 and r["kernels"][0]["modeled"] > 0
+    assert r["stack"]["attention"] == "math" and r["stack"]["kernel_multiplier"] == pytest.approx(mult)
+    assert r["fitted"]["score_passes"] == pytest.approx(6.0, rel=0.1)
     assert len(r["rows"]) == len(ms) and sum(x["holdout"] for x in r["rows"]) == r["n_holdout"]
+
+
+def test_published_t4_calibration_holds():
+    """Regression guard on the real T4 measurements committed in calibration/results/t4."""
+    import os
+    path = os.path.join(os.path.dirname(__file__), "..", "calibration", "results", "t4")
+    if not os.path.exists(os.path.join(path, "steps.csv")):
+        pytest.skip("no measurements committed")
+    r = cal.report_from_path(path, get("t4"))
+    assert r["mape_holdout_after"] < 10.0
+    assert r["mape_holdout_after"] < r["mape_holdout_before"] < r["mape_holdout_default_stack"]
+    assert r["gemm"]["mape_after"] < 20.0
+    assert r["by_model_phase"]["qwen2.5-0.5b decode"]["after"] < 5.0

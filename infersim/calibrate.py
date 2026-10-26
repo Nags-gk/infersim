@@ -1,25 +1,43 @@
-"""Fit the model's efficiency knobs to measured latencies, and report the error.
+"""Fit the model to measured latencies, and report the error honestly.
 
 A measurement is one timed forward pass (a prefill of ``batch`` prompts of ``tokens``
-each, or a decode step of ``batch`` sequences at context ``tokens``). Calibration fits
-``eff_compute``, ``eff_memory`` and ``launch_overhead`` of a ``HardwareSpec`` by
-minimizing squared log error with Nelder-Mead (pure Python, no SciPy needed), and
-reports MAPE before and after, overall and per phase.
+each, or a decode step of ``batch`` sequences at context ``tokens``).
+
+Calibration has two parts, kept separate on purpose:
+
+1. **Structure from profiling, not fitting.** The software stack's kernel multiplier is set
+   from ``torch.profiler`` kernel counts (measured kernels / modeled kernels), and the
+   attention implementation is chosen from what the GPU supports.
+2. **Efficiencies by fitting.** ``eff_compute``, ``eff_memory``, the per-kernel launch cost
+   and (for math attention) the number of passes over materialized tensors are fitted by
+   minimizing squared log error with Nelder-Mead (pure Python), on a training split.
+
+The report gives error on a held-out split, for three setups: the stack InferSim assumes
+by default, the measured stack with default efficiencies, and the measured stack fitted.
 """
 
 from __future__ import annotations
 
 import csv
 import math
+import statistics
 from dataclasses import dataclass
 
 from .hardware import HardwareSpec
 from .models import preset as get_model
-from .ops import StepShape
+from .ops import PRECISIONS, StepShape, gemm, step_ops
+from .roofline import time_op
+from .stack import STACKS, Stack
 from .system import GPUDeployment
 
-PARAMS = ("eff_compute", "eff_memory", "launch_overhead")
-BOUNDS = {"eff_compute": (0.05, 1.0), "eff_memory": (0.05, 1.0), "launch_overhead": (0.0, 1e-4)}
+# (owner, field, lower bound, upper bound, simplex step)
+PARAMS = (
+    ("hw", "eff_compute", 0.05, 1.0, 0.2),
+    ("hw", "eff_memory", 0.05, 1.0, 0.2),
+    ("hw", "launch_overhead", 0.0, 1e-4, 5e-6),
+    ("stack", "math_passes", 0.5, 10.0, 1.0),
+    ("stack", "score_passes", 0.5, 12.0, 1.0),
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +55,27 @@ class Measurement:
         return StepShape.decode(self.batch, self.tokens)
 
 
+@dataclass(frozen=True)
+class Setup:
+    hw: HardwareSpec
+    stack: Stack = STACKS["fused"]
+
+    def params(self) -> list[tuple]:
+        return [p for p in PARAMS if p[0] == "hw" or self.stack.attention == "math"]
+
+    def values(self) -> list[float]:
+        return [getattr(self.hw if o == "hw" else self.stack, f) for o, f, *_ in self.params()]
+
+    def with_values(self, x: list[float]) -> Setup:
+        hw_kw, st_kw = {}, {}
+        for (o, f, lo, hi, _), v in zip(self.params(), x):
+            (hw_kw if o == "hw" else st_kw)[f] = min(max(v, lo), hi)
+        return Setup(self.hw.with_overrides(**hw_kw), self.stack.with_overrides(**st_kw))
+
+    def as_dict(self) -> dict:
+        return {f: v for (_, f, *_), v in zip(self.params(), self.values())}
+
+
 def load_csv(path: str) -> list[Measurement]:
     out = []
     with open(path, newline="") as f:
@@ -46,29 +85,34 @@ def load_csv(path: str) -> list[Measurement]:
     return out
 
 
-def predict(m: Measurement, hw: HardwareSpec) -> float:
-    dep = GPUDeployment(get_model(m.model), hw, tp=1, precision=m.precision)
+def _setup(s: Setup | HardwareSpec) -> Setup:
+    return s if isinstance(s, Setup) else Setup(s)
+
+
+def predict(m: Measurement, setup: Setup | HardwareSpec) -> float:
+    s = _setup(setup)
+    dep = GPUDeployment(get_model(m.model), s.hw, tp=1, precision=m.precision, stack=s.stack)
     return dep.step(m.shape()).latency_s
 
 
-def mape(ms: list[Measurement], hw: HardwareSpec) -> float:
-    return 100.0 * sum(abs(predict(m, hw) - m.measured_s) / m.measured_s for m in ms) / len(ms)
+def mape(ms: list[Measurement], setup: Setup | HardwareSpec) -> float:
+    return 100.0 * sum(abs(predict(m, setup) - m.measured_s) / m.measured_s for m in ms) / len(ms)
 
 
-def _clamp(x: list[float]) -> list[float]:
-    return [min(max(v, BOUNDS[p][0]), BOUNDS[p][1]) for v, p in zip(x, PARAMS)]
+def _loss(x: list[float], ms: list[Measurement], base: Setup, gemms: list | None = None) -> float:
+    """Mean squared log error over steps, plus the same over isolated GEMMs when given.
+
+    The GEMM term pins the efficiencies to what single kernels actually achieve, so the step
+    fit cannot quietly push them to unphysical values to absorb work the model lacks.
+    """
+    s = base.with_values(x)
+    loss = sum(math.log(predict(m, s) / m.measured_s) ** 2 for m in ms) / len(ms)
+    if gemms:
+        loss += sum(math.log(predict_gemm(g, s.hw) / g.measured_s) ** 2 for g in gemms) / len(gemms)
+    return loss
 
 
-def _to_hw(hw: HardwareSpec, x: list[float]) -> HardwareSpec:
-    return hw.with_overrides(**dict(zip(PARAMS, _clamp(x))))
-
-
-def _loss(x: list[float], ms: list[Measurement], hw: HardwareSpec) -> float:
-    h = _to_hw(hw, x)
-    return sum(math.log(predict(m, h) / m.measured_s) ** 2 for m in ms) / len(ms)
-
-
-def nelder_mead(f, x0: list[float], scale: list[float], iters: int = 400, tol: float = 1e-10) -> list[float]:
+def nelder_mead(f, x0: list[float], scale: list[float], iters: int = 600, tol: float = 1e-10) -> list[float]:
     n = len(x0)
     simplex = [list(x0)] + [[x0[j] + (scale[j] if j == i else 0.0) for j in range(n)] for i in range(n)]
     vals = [f(p) for p in simplex]
@@ -108,27 +152,32 @@ class CalibrationResult:
     holdout_mape_before: float | None
     holdout_mape_after: float | None
     per_phase_after: dict[str, float]
-    hardware: HardwareSpec
+    setup: Setup
+
+    @property
+    def hardware(self) -> HardwareSpec:
+        return self.setup.hw
 
 
-def fit(train: list[Measurement], hw: HardwareSpec, holdout: list[Measurement] | None = None) -> CalibrationResult:
-    x0 = [getattr(hw, p) for p in PARAMS]
-    scale = [0.2, 0.2, 5e-6]
-    best = _clamp(nelder_mead(lambda x: _loss(x, train, hw), x0, scale))
-    tuned = _to_hw(hw, best)
+def fit(train: list[Measurement], setup: Setup | HardwareSpec,
+        holdout: list[Measurement] | None = None, gemms: list | None = None) -> CalibrationResult:
+    base = _setup(setup)
+    x0 = base.values()
+    scale = [p[4] for p in base.params()]
+    tuned = base.with_values(nelder_mead(lambda x: _loss(x, train, base, gemms), x0, scale, iters=1500))
     phases = {}
     for ph in ("prefill", "decode"):
         sub = [m for m in (train + (holdout or [])) if m.phase == ph]
         if sub:
             phases[ph] = mape(sub, tuned)
     return CalibrationResult(
-        fitted=dict(zip(PARAMS, best)),
-        mape_before=mape(train, hw),
+        fitted=tuned.as_dict(),
+        mape_before=mape(train, base),
         mape_after=mape(train, tuned),
-        holdout_mape_before=mape(holdout, hw) if holdout else None,
+        holdout_mape_before=mape(holdout, base) if holdout else None,
         holdout_mape_after=mape(holdout, tuned) if holdout else None,
         per_phase_after=phases,
-        hardware=tuned,
+        setup=tuned,
     )
 
 
@@ -140,7 +189,7 @@ def split(ms: list[Measurement], every: int = 4) -> tuple[list[Measurement], lis
 
 
 # ---------------------------------------------------------------------------
-# GEMM-level validation and the full calibration report
+# GEMM-level validation, kernel counts and the full report
 
 
 @dataclass(frozen=True)
@@ -159,11 +208,8 @@ def load_gemm_csv(path: str, dtype: str = "fp16") -> list[GemmMeasurement]:
 
 
 def predict_gemm(g: GemmMeasurement, hw: HardwareSpec) -> float:
-    from .ops import PRECISIONS, gemm
-    from .roofline import time_op
-
-    prec = PRECISIONS[g.dtype]
-    return time_op(gemm("g", "ffn", g.m, g.n, g.k, prec, hw.tile_m, hw.tile_n, 1), hw).time_s
+    """One isolated GEMM: host launch plus device time (nothing to overlap with)."""
+    return time_op(gemm("g", "ffn", g.m, g.n, g.k, PRECISIONS[g.dtype], hw.tile_m, hw.tile_n, 1), hw).time_s
 
 
 def gemm_mape(gs: list[GemmMeasurement], hw: HardwareSpec) -> float:
@@ -171,14 +217,24 @@ def gemm_mape(gs: list[GemmMeasurement], hw: HardwareSpec) -> float:
 
 
 def model_kernels(m: Measurement) -> int:
-    """Kernel launches the model assumes for one step (all layers)."""
-    from .ops import PRECISIONS, step_ops
-
+    """Kernel launches the fused op list assumes for one step (all layers)."""
     return int(sum(o.kernels * o.count for o in step_ops(get_model(m.model), m.shape(), 1, PRECISIONS[m.precision])
                    if o.kind not in ("allreduce", "alltoall")))
 
 
-def _rows(ms: list[Measurement], before: HardwareSpec, after: HardwareSpec, held: set[int]) -> list[dict]:
+def kernel_multiplier(steps: list[Measurement], kernels: dict) -> float | None:
+    ratios = [kernels[(m.model, m.phase, m.batch, m.tokens)] / model_kernels(m) for m in steps
+              if kernels.get((m.model, m.phase, m.batch, m.tokens), 0) > 0]
+    return statistics.median(ratios) if ratios else None
+
+
+def load_kernels_csv(path: str) -> dict:
+    with open(path, newline="") as f:
+        return {(r["model"], r["phase"], int(r["batch"]), int(r["tokens"])): int(r["cuda_kernels"])
+                for r in csv.DictReader(f)}
+
+
+def _rows(ms: list[Measurement], before: Setup, after: Setup, held: set[int]) -> list[dict]:
     out = []
     for i, m in enumerate(ms):
         pb, pa = predict(m, before), predict(m, after)
@@ -190,30 +246,45 @@ def _rows(ms: list[Measurement], before: HardwareSpec, after: HardwareSpec, held
 
 
 def report(steps: list[Measurement], hw: HardwareSpec, gemms: list[GemmMeasurement] | None = None,
-           kernels: dict | None = None, env: dict | None = None, every: int = 4) -> dict:
-    """Fit on a training split and report everything the dashboard and README need."""
+           kernels: dict | None = None, env: dict | None = None, every: int = 4,
+           stack: Stack | None = None) -> dict:
+    """Fit on a training split and report everything the dashboard and README need.
+
+    ``stack`` defaults to the eager PyTorch stack when kernel counts are available (with its
+    kernel multiplier taken from them), else to the fused stack.
+    """
+    km = kernel_multiplier(steps, kernels) if kernels else None
+    if stack is None:
+        stack = STACKS["eager"].with_overrides(kernel_multiplier=km) if km else STACKS["fused"]
     train, hold = split(steps, every)
-    r = fit(train, hw, hold)
+    default = Setup(hw, STACKS["fused"])
+    base = Setup(hw, stack)
+    r = fit(train, base, hold, gemms)
     held = {i for i in range(len(steps)) if not i % every}
     by_model = {}
     for name in sorted({m.model for m in steps}):
         for ph in ("prefill", "decode"):
             sub = [m for m in steps if m.model == name and m.phase == ph]
             if sub:
-                by_model[f"{name} {ph}"] = {"before": mape(sub, hw), "after": mape(sub, r.hardware), "n": len(sub)}
+                by_model[f"{name} {ph}"] = {"default": mape(sub, default), "before": mape(sub, base),
+                                            "after": mape(sub, r.setup), "n": len(sub)}
     out = {
         "hardware": hw.name,
+        "stack": {"name": stack.name, "attention": stack.attention, "kernel_multiplier": stack.kernel_multiplier,
+                  "async_launch": stack.async_launch},
         "env": env or {},
         "fitted": r.fitted,
-        "defaults": {p: getattr(hw, p) for p in PARAMS},
+        "at_bound": [f for (o, f, lo, hi, _) in base.params() if not lo < r.fitted[f] < hi],
+        "defaults": base.as_dict(),
         "n_measurements": len(steps),
         "n_holdout": len(hold),
+        "mape_holdout_default_stack": mape(hold, default) if hold else None,
         "mape_train_before": r.mape_before,
         "mape_train_after": r.mape_after,
         "mape_holdout_before": r.holdout_mape_before,
         "mape_holdout_after": r.holdout_mape_after,
         "by_model_phase": by_model,
-        "rows": _rows(steps, hw, r.hardware, held),
+        "rows": _rows(steps, base, r.setup, held),
     }
     if gemms:
         out["gemm"] = {
@@ -227,20 +298,10 @@ def report(steps: list[Measurement], hw: HardwareSpec, gemms: list[GemmMeasureme
                       "intensity": 2 * g.m * g.n * g.k / ((g.m * g.k + g.k * g.n + g.m * g.n) * 2)} for g in gemms],
         }
     if kernels:
-        rows = []
-        for m in steps:
-            key = (m.model, m.phase, m.batch, m.tokens)
-            if key in kernels and kernels[key] > 0:
-                rows.append({"model": m.model, "phase": m.phase, "batch": m.batch, "tokens": m.tokens,
-                             "measured": kernels[key], "modeled": model_kernels(m)})
-        out["kernels"] = rows
+        out["kernels"] = [{"model": m.model, "phase": m.phase, "batch": m.batch, "tokens": m.tokens,
+                           "measured": kernels[(m.model, m.phase, m.batch, m.tokens)], "modeled": model_kernels(m)}
+                          for m in steps if kernels.get((m.model, m.phase, m.batch, m.tokens), 0) > 0]
     return out
-
-
-def load_kernels_csv(path: str) -> dict:
-    with open(path, newline="") as f:
-        return {(r["model"], r["phase"], int(r["batch"]), int(r["tokens"])): int(r["cuda_kernels"])
-                for r in csv.DictReader(f)}
 
 
 def report_from_path(path: str, hw: HardwareSpec) -> dict:

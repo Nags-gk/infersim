@@ -8,6 +8,7 @@ Writes:
   steps.csv     model,phase,batch,tokens,measured_s,precision   (input to `infersim calibrate`)
   gemm.csv      m,n,k,measured_s,tflops                         (single fp16 GEMMs)
   kernels.csv   model,phase,batch,tokens,cuda_kernels           (torch.profiler kernel counts per step)
+  top_kernels_<model>.json  slowest kernels for two steps (identifies the attention backend)
   env.json      GPU, driver, library versions, settings
 
 Timing: CUDA events around the forward pass, warmup iterations first, median of N
@@ -114,6 +115,23 @@ def count_kernels(fn, device: str) -> int:
     return sum(1 for e in prof.events() if e.device_type.name == "CUDA")
 
 
+def top_kernels(fn, device: str, n: int = 12) -> list[dict]:
+    """Slowest CUDA kernels in one step, by total GPU time (names identify the SDPA backend)."""
+    if device != "cuda":
+        return []
+    from torch.profiler import ProfilerActivity, profile
+
+    fn()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    rows = [e for e in prof.key_averages() if getattr(e, "device_type", None) is not None
+            and e.device_type.name == "CUDA"]
+    rows.sort(key=lambda e: e.device_time_total, reverse=True)
+    return [{"name": e.key[:160], "calls": e.count, "gpu_us": e.device_time_total} for e in rows[:n]]
+
+
 def run(out: str, models, dtype_name: str, warmup: int, iters: int, config=None, decode=DECODE,
         prefill=PREFILL, gemm_m=GEMM_M, gemm_nk=GEMM_NK) -> dict:
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -137,6 +155,11 @@ def run(out: str, models, dtype_name: str, warmup: int, iters: int, config=None,
                     steps.append([name, phase, batch, tokens, f"{t:.6e}", dtype_name])
                     kernels.append([name, phase, batch, tokens, k])
                     print(f"  {name} {phase:7s} b={batch:<3d} t={tokens:<5d} {t * 1e3:8.2f} ms  kernels={k}")
+            if device == "cuda":
+                tops = {"decode b=16 ctx=2048": top_kernels(decode_fn(model, 16, 2048, device), device),
+                        "prefill b=1 s=2048": top_kernels(prefill_fn(model, 1, 2048, device), device)}
+                with open(os.path.join(out, f"top_kernels_{name}.json"), "w") as f:
+                    json.dump(tops, f, indent=1)
             del model
             if device == "cuda":
                 torch.cuda.empty_cache()

@@ -5,4 +5,4 @@ site/_pyodide
 .hypothesis/
 .ruff_cache/
 site/py/
-results/
+/results/

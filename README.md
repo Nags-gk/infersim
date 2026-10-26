@@ -51,20 +51,43 @@ For each operator, time = max(compute, memory) + launch overhead, where compute 
 FLOPs at `eff_compute` x peak and memory is bytes moved at `eff_memory` x bandwidth. Collectives
 use an alpha-beta model. Tests check that no operator beats its ideal roofline time.
 
-**Calibration against a real GPU.** `notebooks/t4_calibration.ipynb` runs on Colab's free T4:
-it times prefill and decode steps for Qwen2.5-0.5B and 1.5B with PyTorch and transformers (FP16, SDPA,
-CUDA events, median of 10 after warmup), times single GEMMs at the models' real layer shapes, and
-counts CUDA kernels per step with `torch.profiler` (`calibration/measure.py`). `infersim calibrate`
-then fits compute efficiency, memory efficiency and per-kernel overhead on three quarters of the
-steps and reports error on the held-out quarter. Results appear in the dashboard's Validation
-section once published. Until then, every latency here is modeled: use absolute numbers as
-estimates and comparisons between layouts as the point.
+## Validation on a real GPU
+
+`notebooks/t4_calibration.ipynb` runs `calibration/measure.py` on Colab's free T4: 39 timed
+prefill and decode steps for Qwen2.5-0.5B and 1.5B (PyTorch 2.11, transformers 5.20, FP16, CUDA
+events, median of 10 after warmup), 30 isolated GEMMs at the models' layer shapes, and
+`torch.profiler` kernel counts. The raw data is in `calibration/results/t4/`; a test fails if the
+published accuracy regresses.
+
+| Held-out steps (every 4th, not used in the fit) | Mean absolute error |
+|---|---|
+| InferSim's stock assumptions (fused engine) | 80% |
+| Measured software stack, default efficiencies | 58% |
+| **Measured stack, calibrated** | **7.2%** (decode 1.7-2.6%, prefill 13-14%) |
+| Isolated GEMMs, same calibration | 14% |
+
+What closed the gap was modeling the software stack, not tuning knobs:
+
+- **Host-bound decode.** The profiler counted 5.3x the kernels the fused op list assumes; at
+  about 26 us of host time per kernel, small-batch decode sits at a flat ~36-43 ms floor. Kernel
+  launches overlap GPU work, so a step costs max(host, GPU), not the sum.
+- **Non-flash attention.** FlashAttention needs Ampere or newer; the T4 is Turing. The timings fit
+  an attention path that expands grouped K/V to every query head in FP32 and materializes the
+  S x S scores in prefill: decode time grows with batch x context far faster than the KV-cache
+  size implies, and prefill grows faster than linearly. The next run records the slowest kernel
+  names to confirm which SDPA backend ran.
+- **Efficiencies are fitted jointly with the GEMM timings**, so they cannot drift to unphysical
+  values to absorb unmodeled work. **Known gap:** the prefill score-pass count hits its bound,
+  so eager prefill moves more memory than modeled (likely FP32 upcasts in norms and activations).
+
+The calibration is for this GPU and this stack. Other devices keep default efficiencies, and the
+design-space results assume a fused serving engine.
 
 ## Run it
 
 ```bash
 pip install -e ".[dev]"
-pytest -q                                   # 50 tests, about 1 s
+pytest -q                                   # 51 tests, a few seconds
 infersim step --model llama-3.1-70b --hw h100 --tp 8 --batch 32
 infersim roofline --model llama-3.1-8b --hw h100 --phase prefill --tokens 4096
 infersim dse --model deepseek-v3 --sla 50
@@ -92,6 +115,7 @@ infersim/
   hardware.py    device catalog with sources and assumptions
   ops.py         one step -> operators (GEMMs, attention, collectives)
   roofline.py    operator timing, ring / one-shot all-reduce, all-to-all
+  stack.py       software stacks: attention path, kernel inflation, async launch
   system.py      GPU, LPU, disaggregated and attention/FFN-split deployments
   serving.py     continuous-batching discrete-event simulator
   dse.py         sweeps, Pareto frontier, best layout under an SLA
@@ -113,8 +137,7 @@ so an agent cannot add a device without a source or a model whose parameter coun
 ## Limitations
 
 - Calibration covers one GPU (T4) and one software stack (eager PyTorch); other devices keep
-  default efficiencies. Launch overhead dominates some low-batch GPU results and depends heavily on
-  the stack (CUDA graphs, fused kernels).
+  default efficiencies, and fused-engine (CUDA graphs, FlashAttention) accuracy is not yet measured.
 - Communication does not overlap with compute; real stacks hide some of it.
 - MoE experts are assumed load-balanced; no expert imbalance or token dropping.
 - LPU and heterogeneous models use assumed compute, link bandwidth and latency.

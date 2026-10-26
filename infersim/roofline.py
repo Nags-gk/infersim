@@ -54,7 +54,7 @@ def p2p_time(nbytes: float, bw: float, latency: float) -> float:
     return latency + nbytes / bw if nbytes > 0 else 0.0
 
 
-def time_op(op: Op, hw: HardwareSpec) -> OpTiming:
+def time_op(op: Op, hw: HardwareSpec, kernel_multiplier: float = 1.0) -> OpTiming:
     if op.kind in ("allreduce", "alltoall"):
         fn = allreduce_time if op.kind == "allreduce" else alltoall_time
         c = fn(op.comm_bytes, op.group, hw.link_bw, hw.link_latency)
@@ -62,7 +62,7 @@ def time_op(op: Op, hw: HardwareSpec) -> OpTiming:
     peak = hw.peak(op.dtype)
     compute = op.flops_padded / (peak * hw.eff_compute) if op.flops_padded else 0.0
     memory = op.bytes / (hw.mem_bw * hw.eff_memory) if op.bytes else 0.0
-    overhead = hw.launch_overhead * op.kernels
+    overhead = hw.launch_overhead * op.kernels * kernel_multiplier
     body = max(compute, memory)
     bound = "compute" if compute >= memory else "memory"
     if overhead > body:

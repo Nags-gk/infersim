@@ -4,6 +4,8 @@
 
 **Live dashboard: https://nags-gk.github.io/infersim/** (the Python package runs in your browser via Pyodide)
 
+[![Open the T4 calibration notebook in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Nags-gk/infersim/blob/main/notebooks/t4_calibration.ipynb)
+
 A performance model for LLM inference on GPUs, LPUs and heterogeneous systems. Every layer of a
 Hugging Face model becomes operators with FLOPs and bytes; each operator is timed on a roofline;
 a serving simulator and a design space sweep turn that into the numbers inference teams argue
@@ -49,21 +51,26 @@ For each operator, time = max(compute, memory) + launch overhead, where compute 
 FLOPs at `eff_compute` x peak and memory is bytes moved at `eff_memory` x bandwidth. Collectives
 use an alpha-beta model. Tests check that no operator beats its ideal roofline time.
 
-**Not yet measured.** All latencies are modeled. The efficiency knobs are defaults, not fitted.
-Calibration against a real GPU (a T4, with `torch.profiler`) is the next milestone; the fitter and
-its holdout evaluation are already in `infersim/calibrate.py` and tested on synthetic data. Use the
-absolute numbers as estimates and the comparisons between layouts as the point.
+**Calibration against a real GPU.** `notebooks/t4_calibration.ipynb` runs on Colab's free T4:
+it times prefill and decode steps for Qwen2.5-0.5B and 1.5B with PyTorch and transformers (FP16, SDPA,
+CUDA events, median of 10 after warmup), times single GEMMs at the models' real layer shapes, and
+counts CUDA kernels per step with `torch.profiler` (`calibration/measure.py`). `infersim calibrate`
+then fits compute efficiency, memory efficiency and per-kernel overhead on three quarters of the
+steps and reports error on the held-out quarter. Results appear in the dashboard's Validation
+section once published. Until then, every latency here is modeled: use absolute numbers as
+estimates and comparisons between layouts as the point.
 
 ## Run it
 
 ```bash
 pip install -e ".[dev]"
-pytest -q                                   # 49 tests, about 1 s
+pytest -q                                   # 50 tests, about 1 s
 infersim step --model llama-3.1-70b --hw h100 --tp 8 --batch 32
 infersim roofline --model llama-3.1-8b --hw h100 --phase prefill --tokens 4096
 infersim dse --model deepseek-v3 --sla 50
 infersim serve --model llama-3.1-8b --hw h100 --rate 12 --requests 300
-infersim calibrate measurements.csv --hw t4   # columns: model,phase,batch,tokens,measured_s
+python calibration/measure.py --out results/t4   # on a GPU machine
+infersim calibrate results/t4 --hw t4 --out report.json
 python bench/run_bench.py                   # regenerate site/data/results.json
 ```
 
@@ -88,8 +95,10 @@ infersim/
   system.py      GPU, LPU, disaggregated and attention/FFN-split deployments
   serving.py     continuous-batching discrete-event simulator
   dse.py         sweeps, Pareto frontier, best layout under an SLA
-  calibrate.py   Nelder-Mead fit of efficiencies to measurements, MAPE
+  calibrate.py   Nelder-Mead fit to measurements, holdout MAPE, GEMM and kernel-count checks
   web.py         JSON views for the dashboard
+calibration/     measure.py: GPU timing harness (prefill, decode, GEMMs, profiler kernel counts)
+notebooks/       Colab notebook that runs the harness on a free T4
 site/            dashboard (static HTML/JS + Pyodide worker)
 tests/           pytest + Hypothesis property tests
 .claude/         Claude Code skills and a hook that runs the guardrail tests on every edit
@@ -103,8 +112,9 @@ so an agent cannot add a device without a source or a model whose parameter coun
 
 ## Limitations
 
-- No measured calibration yet (see above). Launch overhead dominates some low-batch GPU results
-  and is the parameter most likely to move after calibration.
+- Calibration covers one GPU (T4) and one software stack (eager PyTorch); other devices keep
+  default efficiencies. Launch overhead dominates some low-batch GPU results and depends heavily on
+  the stack (CUDA graphs, fused kernels).
 - Communication does not overlap with compute; real stacks hide some of it.
 - MoE experts are assumed load-balanced; no expert imbalance or token dropping.
 - LPU and heterogeneous models use assumed compute, link bandwidth and latency.

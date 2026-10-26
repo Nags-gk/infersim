@@ -58,9 +58,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--requests", type=int, default=200)
     p.add_argument("--prompt", type=int, default=1024)
     p.add_argument("--output", type=int, default=256)
-    p = sub.add_parser("calibrate", help="fit efficiencies to measured latencies (CSV)")
-    p.add_argument("csv")
+    p = sub.add_parser("calibrate", help="fit efficiencies to measurements (a steps.csv, or a folder from measure.py)")
+    p.add_argument("path")
     p.add_argument("--hw", default="t4", choices=sorted(CATALOG))
+    p.add_argument("--out", help="write the full report as JSON here")
     for p in sub.choices.values():
         p.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
@@ -83,12 +84,11 @@ def main(argv: list[str] | None = None) -> int:
         reqs = poisson_workload(a.rate, a.requests, a.prompt, a.output, jitter=0.2)
         out = simulate(_deployment(a), reqs).summary()
     else:
-        ms = cal.load_csv(a.csv)
-        train, hold = cal.split(ms)
-        r = cal.fit(train, get_hw(a.hw), hold)
-        out = {"fitted": r.fitted, "mape_before": r.mape_before, "mape_after": r.mape_after,
-               "holdout_mape_before": r.holdout_mape_before, "holdout_mape_after": r.holdout_mape_after,
-               "per_phase_after": r.per_phase_after}
+        out = cal.report_from_path(a.path, get_hw(a.hw))
+        if a.out:
+            with open(a.out, "w") as f:
+                json.dump(out, f)
+        out = {k: v for k, v in out.items() if k not in ("rows", "gemm", "kernels")}
     json.dump(out, sys.stdout, indent=None if a.json else 2, default=str)
     print()
     return 0

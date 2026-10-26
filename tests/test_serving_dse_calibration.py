@@ -87,3 +87,19 @@ def test_calibration_recovers_known_parameters():
     assert r.holdout_mape_after < 1.0
     assert r.fitted["eff_memory"] == pytest.approx(0.62, rel=0.05)
     assert r.fitted["launch_overhead"] == pytest.approx(9e-6, rel=0.15)
+
+
+def test_report_from_measure_folder(tmp_path):
+    truth = get("t4").with_overrides(eff_compute=0.5, eff_memory=0.7, launch_overhead=12e-6)
+    ms = _synthetic(truth)
+    (tmp_path / "steps.csv").write_text(
+        "model,phase,batch,tokens,measured_s,precision\n"
+        + "".join(f"{m.model},{m.phase},{m.batch},{m.tokens},{m.measured_s},fp16\n" for m in ms))
+    gem = [cal.GemmMeasurement(m, 4864, 896, 1.0) for m in (1, 64, 512)]
+    (tmp_path / "gemm.csv").write_text(
+        "m,n,k,measured_s,tflops\n" + "".join(f"{g.m},{g.n},{g.k},{cal.predict_gemm(g, truth)},0\n" for g in gem))
+    (tmp_path / "kernels.csv").write_text("model,phase,batch,tokens,cuda_kernels\nqwen2.5-0.5b,decode,1,256,700\n")
+    r = cal.report_from_path(str(tmp_path), get("t4"))
+    assert r["mape_holdout_after"] < 1.0 and r["gemm"]["mape_after"] < 2.0
+    assert r["kernels"][0]["measured"] == 700 and r["kernels"][0]["modeled"] > 0
+    assert len(r["rows"]) == len(ms) and sum(x["holdout"] for x in r["rows"]) == r["n_holdout"]

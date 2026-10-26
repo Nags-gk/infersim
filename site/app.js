@@ -364,6 +364,55 @@ function renderHW() {
   $("#hw-table").innerHTML = `<tr><th>device</th><th>kind</th><th class="num">peak FLOP/s (dense)</th><th class="num">memory BW</th><th class="num">capacity</th><th class="num">link / dir</th><th>sources and assumptions</th></tr>` + rows;
 }
 
+
+// ---------- validation ----------
+const COLAB = "https://colab.research.google.com/github/Nags-gk/infersim/blob/main/notebooks/t4_calibration.ipynb";
+let V = null;
+function renderValidation() {
+  const body = $("#val-body");
+  if (!V) {
+    body.innerHTML = `<div class="panel"><p class="note">No measurements published yet. Run the <a href="${COLAB}">T4 calibration notebook</a> (free Colab GPU, about 15 minutes) to produce them.</p></div>`;
+    return;
+  }
+  const f = V.fitted;
+  body.innerHTML = `<div class="kpis">
+      ${kpi(V.mape_holdout_before.toFixed(1) + "%", "holdout error, default knobs")}
+      ${kpi(V.mape_holdout_after.toFixed(1) + "%", "holdout error, calibrated")}
+      ${kpi(V.n_measurements, "timed steps (" + V.n_holdout + " held out)")}
+      ${V.gemm ? kpi(V.gemm.mape_after.toFixed(1) + "%", "single-GEMM error") : ""}
+      ${kpi((f.eff_memory * 100).toFixed(0) + "%", "fitted memory efficiency")}
+      ${kpi((f.launch_overhead * 1e6).toFixed(1) + " us", "fitted cost per kernel")}
+    </div>
+    <div class="split" style="margin-top:14px">
+      <div class="panel"><div class="panel-head"><h3>Predicted vs measured step time</h3><span class="legend" id="val-legend"></span></div><div id="val-scatter" class="chart"></div></div>
+      <div class="panel"><div class="panel-head"><h3>Single GEMMs on the T4 roofline</h3></div><div id="val-gemm" class="chart"></div></div>
+    </div>
+    <div class="panel" style="margin-top:14px"><h3>Error by model and phase (MAPE)</h3><table class="tbl" id="val-table"></table>
+    <p class="note">${esc(V.env.device || "")} &middot; torch ${esc(V.env.torch || "")} &middot; transformers ${esc(V.env.transformers || "")} &middot; ${esc(V.env.dtype || "")} &middot; ${esc(V.env.timing || "")}</p></div>`;
+  const ph = { prefill: css("--ffn"), decode: css("--attention") };
+  const rows = V.rows;
+  const all = rows.flatMap((r) => [r.measured_ms, r.predicted_after_ms]);
+  const lo = Math.min(...all) / 1.5, hi = Math.max(...all) * 1.5;
+  plot($("#val-scatter"), {
+    title: "parity", xLog: true, yLog: true, xLabel: "measured (ms)", yLabel: "predicted (ms)", xDomain: [lo, hi], yDomain: [lo, hi],
+    lines: [{ pts: [[lo, lo], [hi, hi]], color: css("--muted"), dash: "4 4", width: 1 }],
+    dots: rows.map((r) => ({ x: r.measured_ms, y: r.predicted_after_ms, r: r.holdout ? 5 : 3.5, color: ph[r.phase], fill: r.holdout ? "none" : ph[r.phase], sw: r.holdout ? 2 : 1,
+      tip: `${r.model} ${r.phase}\nbatch ${r.batch}, ${r.phase === "prefill" ? "prompt" : "context"} ${r.tokens}\nmeasured ${r.measured_ms.toFixed(2)} ms\npredicted ${r.predicted_after_ms.toFixed(2)} ms (${r.error_after_pct >= 0 ? "+" : ""}${r.error_after_pct.toFixed(1)}%)\n${r.holdout ? "held out of the fit" : "used in the fit"}` })),
+  });
+  legend($("#val-legend"), [["prefill", ph.prefill], ["decode", ph.decode], ["hollow = held out", css("--muted")]]);
+  if (V.gemm) {
+    const g = V.gemm, xs = g.rows.map((r) => r.intensity);
+    const x0 = Math.min(...xs) / 2, x1 = Math.max(...xs, g.peak_flops / g.mem_bw) * 3;
+    plot($("#val-gemm"), {
+      title: "gemm", xLog: true, yLog: true, xLabel: "arithmetic intensity (FLOP/byte)", yLabel: "measured FLOP/s", xDomain: [x0, x1],
+      lines: [{ pts: [x0, g.peak_flops / g.mem_bw, x1].map((x) => [x, Math.min(g.peak_flops, x * g.mem_bw)]), color: css("--ink"), width: 2 }],
+      dots: g.rows.map((r) => ({ x: r.intensity, y: r.tflops * 1e12, r: 4, color: css("--comm"), tip: `${r.m} x ${r.k} @ ${r.k} x ${r.n}\nmeasured ${r.measured_us.toFixed(1)} us (${r.tflops.toFixed(2)} TFLOP/s)\npredicted ${r.predicted_after_us.toFixed(1)} us` })),
+    });
+  } else $("#val-gemm").innerHTML = "";
+  $("#val-table").innerHTML = `<tr><th>model / phase</th><th class="num">n</th><th class="num">default knobs</th><th class="num">calibrated</th></tr>` +
+    Object.entries(V.by_model_phase).map(([k, v]) => `<tr><td>${esc(k)}</td><td class="num">${v.n}</td><td class="num">${v.before.toFixed(1)}%</td><td class="num">${v.after.toFixed(1)}%</td></tr>`).join("");
+}
+
 // ---------- nav ----------
 function initNav() {
   const links = [...document.querySelectorAll("#nav a")];
@@ -383,12 +432,17 @@ async function main() {
   initDSE();
   renderServeCurve();
   renderHW();
+  try {
+    const r = await fetch("data/calibration.json");
+    V = r.ok ? await r.json() : null;
+  } catch (e) { V = null; }
+  renderValidation();
   initNav();
   $("#step-form").addEventListener("submit", runStep);
   $("#step-form").addEventListener("change", runStep);
   $("#serve-form").addEventListener("submit", runServe);
   let t;
-  addEventListener("resize", () => { clearTimeout(t); t = setTimeout(() => { renderDSE(); renderServeCurve(); if (lastStep) renderStep(...lastStep); }, 200); });
+  addEventListener("resize", () => { clearTimeout(t); t = setTimeout(() => { renderDSE(); renderServeCurve(); if (lastStep) renderStep(...lastStep); renderValidation(); }, 200); });
   bootEngine();
 }
 main();

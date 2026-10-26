@@ -94,6 +94,13 @@ def main() -> None:
     out["sla_example"] = best_under_sla(sweep(candidate_deployments("llama-3.1-70b"), 2048, 256), 50).as_dict()
     out["generated_in_s"] = round(time.time() - t0, 1)
     (SITE / "data").mkdir(parents=True, exist_ok=True)
+    measured = ROOT / "calibration" / "results" / "t4"
+    if (measured / "steps.csv").exists():
+        from infersim import calibrate
+        from infersim.hardware import get as get_hw
+        rep = calibrate.report_from_path(str(measured), get_hw("t4"))
+        (SITE / "data" / "calibration.json").write_text(json.dumps(rep))
+        print(f"calibration: holdout MAPE {rep['mape_holdout_before']:.1f}% -> {rep['mape_holdout_after']:.1f}%")
     (SITE / "data" / "results.json").write_text(json.dumps(out))
     # copy the package so the page can run it in the browser
     dst = SITE / "py" / "infersim"

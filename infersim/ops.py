@@ -44,6 +44,8 @@ class Precision:
 
 PRECISIONS = {
     "bf16": Precision("bf16", "bf16", "bf16"),
+    "fp16": Precision("fp16", "fp16", "fp16"),
+    "fp32": Precision("fp32", "fp32", "fp32"),
     "fp8": Precision("fp8", "fp8", "bf16"),
     "fp4": Precision("fp4", "fp8", "bf16"),
 }

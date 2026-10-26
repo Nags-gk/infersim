@@ -14,6 +14,7 @@ import math
 from dataclasses import dataclass, field
 
 from .models import ModelConfig
+from .stack import Stack
 
 DTYPE_BYTES = {"fp32": 4.0, "bf16": 2.0, "fp16": 2.0, "fp8": 1.0, "int8": 1.0, "fp4": 0.5}
 
@@ -124,8 +125,10 @@ def expected_active_experts(tokens: int, n_experts: int, top_k: int) -> float:
 
 
 def _attention_ops(model: ModelConfig, step: StepShape, tp: int, prec: Precision,
-                   count: int) -> list[Op]:
+                   count: int, stack: Stack | None = None) -> list[Op]:
     heads = model.heads / tp
+    math = stack is not None and stack.attention == "math" and not model.is_mla
+    extra = (stack.math_passes * stack.math_bytes) if math else 0.0
     ops: list[Op] = []
     if model.is_mla:
         kv_elems = model.kv_lora_rank + model.qk_rope_dim  # latent is replicated on every TP rank
@@ -142,6 +145,8 @@ def _attention_ops(model: ModelConfig, step: StepShape, tp: int, prec: Precision
         b = len(step.decode_ctx)
         byts = ctx_sum * kv_elems * prec.kvb + b * kv_elems * prec.kvb  # read cache, append new
         byts += b * heads * (model.qk_dim + model.v_dim) * prec.ab
+        if math:  # K/V expanded to every query head, in FP32, read/written ``math_passes`` times
+            byts += extra * ctx_sum * heads * (model.qk_dim + model.v_dim)
         ops.append(Op("attn_decode", "attention", "attention", flops, flops, byts, 0.0, 1, count,
                       prec.act, meta={"ctx_sum": ctx_sum, "batch": b}))
     # prefill: causal attention of new tokens over cache + themselves (flash-style, no S^2 traffic)
@@ -153,11 +158,16 @@ def _attention_ops(model: ModelConfig, step: StepShape, tp: int, prec: Precision
             keys += n * p + n * (n + 1) / 2.0
             new += n
             past += p
+        if math:  # the math path computes every score, then masks: no causal savings
+            keys = sum(n * (p + n) for n, p in step.prefill)
         flops = heads * 2 * (model.qk_dim + model.v_dim) * keys
         kv_full = (2 * max(1.0, model.kv_heads / tp) * model.head_dim if not model.is_mla
                    else 2 * heads * model.qk_dim)  # MLA prefill expands K/V per head
         byts = (past + new) * kv_full * prec.ab + new * kv_elems * prec.kvb
         byts += new * heads * (model.qk_dim + model.v_dim) * prec.ab
+        if math:  # S x S scores and per-head K/V materialized in FP32
+            byts += stack.math_bytes * heads * (stack.score_passes * keys
+                                               + stack.math_passes * (past + new) * (model.qk_dim + model.v_dim))
         ops.append(Op("attn_prefill", "attention", "attention", flops, flops, byts, 0.0, 1, count,
                       prec.act, meta={"keys": keys, "new_tokens": new}))
     return ops
@@ -231,7 +241,8 @@ def _elementwise(model: ModelConfig, t: int, tp: int, prec: Precision, width: in
 
 
 def step_ops(model: ModelConfig, step: StepShape, tp: int = 1, prec: Precision | None = None,
-             tile_m: int = 64, tile_n: int = 128, expert_parallel: bool = False) -> list[Op]:
+             tile_m: int = 64, tile_n: int = 128, expert_parallel: bool = False,
+             stack: Stack | None = None) -> list[Op]:
     """All ops for one forward pass of ``step`` on one tensor-parallel rank (all layers)."""
     prec = prec or PRECISIONS["bf16"]
     t = step.tokens
@@ -243,7 +254,7 @@ def step_ops(model: ModelConfig, step: StepShape, tp: int = 1, prec: Precision |
         if n_layers == 0:
             continue
         ops += _projection_ops(model, t, tp, prec, tile_m, tile_n, n_layers)
-        ops += _attention_ops(model, step, tp, prec, n_layers)
+        ops += _attention_ops(model, step, tp, prec, n_layers, stack)
         if kind == "dense":
             ops += _dense_mlp_ops(model, t, model.intermediate, tp, prec, tile_m, tile_n, n_layers)
             width = model.intermediate

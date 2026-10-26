@@ -375,19 +375,26 @@ function renderValidation() {
     return;
   }
   const f = V.fitted;
+  const st = V.stack || {};
   body.innerHTML = `<div class="kpis">
-      ${kpi(V.mape_holdout_before.toFixed(1) + "%", "holdout error, default knobs")}
-      ${kpi(V.mape_holdout_after.toFixed(1) + "%", "holdout error, calibrated")}
-      ${kpi(V.n_measurements, "timed steps (" + V.n_holdout + " held out)")}
-      ${V.gemm ? kpi(V.gemm.mape_after.toFixed(1) + "%", "single-GEMM error") : ""}
-      ${kpi((f.eff_memory * 100).toFixed(0) + "%", "fitted memory efficiency")}
-      ${kpi((f.launch_overhead * 1e6).toFixed(1) + " us", "fitted cost per kernel")}
+      ${kpi(V.mape_holdout_default_stack.toFixed(0) + "%", "error with InferSim's stock assumptions")}
+      ${kpi(V.mape_holdout_before.toFixed(0) + "%", "measured stack, default efficiencies")}
+      ${kpi(V.mape_holdout_after.toFixed(1) + "%", "calibrated (held-out steps)")}
+      ${V.gemm ? kpi(V.gemm.mape_after.toFixed(0) + "%", "isolated GEMM error") : ""}
+      ${kpi(V.n_measurements + " / " + (V.gemm ? V.gemm.rows.length : 0), "timed steps / GEMMs")}
+      ${kpi((st.kernel_multiplier || 1).toFixed(1) + "x", "kernels vs fused (profiler)")}
     </div>
+    <div class="panel" style="margin-top:14px"><h3>What the measurements showed</h3><div class="prose" style="max-width:none">
+      <p>InferSim's defaults describe a fused serving engine (FlashAttention, CUDA graphs). This T4 run used eager PyTorch with transformers, and that stack behaves differently in three measurable ways, which the calibration models explicitly instead of hiding them in the efficiencies:</p>
+      <p><strong>Host-bound decode.</strong> torch.profiler counted ${(st.kernel_multiplier || 1).toFixed(1)}x the kernels the fused op list assumes. At about ${(V.fitted.launch_overhead * 1e6).toFixed(0)} us of host time per kernel, small-batch decode is flat at the launch cost regardless of batch or context. Launches overlap GPU work, so a step costs about max(host, GPU).</p>
+      <p><strong>Non-flash attention.</strong> FlashAttention needs Ampere or newer, and the T4 is Turing. The timings fit an attention path that expands grouped K/V to every query head in FP32 (fitted ${V.fitted.math_passes.toFixed(1)} passes) and materializes the S x S scores in prefill; the profiler's kernel names would confirm which SDPA backend ran. That is why decode time grows with batch x context far faster than the KV cache size implies, and prefill grows faster than linearly.</p>
+      <p><strong>Known gap.</strong> ${(V.at_bound || []).length ? `The fit pins ${V.at_bound.map(esc).join(", ")} at its bound: eager prefill moves more memory than the model accounts for (likely FP32 upcasts in norms and activations), so prefill error (see table) is higher than decode.` : "No fitted parameter sits at its bound."} Efficiencies are fitted jointly with isolated GEMM timings so they stay physically consistent.</p>
+    </div></div>
     <div class="split" style="margin-top:14px">
       <div class="panel"><div class="panel-head"><h3>Predicted vs measured step time</h3><span class="legend" id="val-legend"></span></div><div id="val-scatter" class="chart"></div></div>
       <div class="panel"><div class="panel-head"><h3>Single GEMMs on the T4 roofline</h3></div><div id="val-gemm" class="chart"></div></div>
     </div>
-    <div class="panel" style="margin-top:14px"><h3>Error by model and phase (MAPE)</h3><table class="tbl" id="val-table"></table>
+    <div class="panel" style="margin-top:14px"><h3>Mean absolute error by model and phase</h3><table class="tbl" id="val-table"></table>
     <p class="note">${esc(V.env.device || "")} &middot; torch ${esc(V.env.torch || "")} &middot; transformers ${esc(V.env.transformers || "")} &middot; ${esc(V.env.dtype || "")} &middot; ${esc(V.env.timing || "")}</p></div>`;
   const ph = { prefill: css("--ffn"), decode: css("--attention") };
   const rows = V.rows;
@@ -409,8 +416,8 @@ function renderValidation() {
       dots: g.rows.map((r) => ({ x: r.intensity, y: r.tflops * 1e12, r: 4, color: css("--comm"), tip: `${r.m} x ${r.k} @ ${r.k} x ${r.n}\nmeasured ${r.measured_us.toFixed(1)} us (${r.tflops.toFixed(2)} TFLOP/s)\npredicted ${r.predicted_after_us.toFixed(1)} us` })),
     });
   } else $("#val-gemm").innerHTML = "";
-  $("#val-table").innerHTML = `<tr><th>model / phase</th><th class="num">n</th><th class="num">default knobs</th><th class="num">calibrated</th></tr>` +
-    Object.entries(V.by_model_phase).map(([k, v]) => `<tr><td>${esc(k)}</td><td class="num">${v.n}</td><td class="num">${v.before.toFixed(1)}%</td><td class="num">${v.after.toFixed(1)}%</td></tr>`).join("");
+  $("#val-table").innerHTML = `<tr><th>model / phase</th><th class="num">n</th><th class="num">stock assumptions</th><th class="num">measured stack, default efficiencies</th><th class="num">calibrated</th></tr>` +
+    Object.entries(V.by_model_phase).map(([k, v]) => `<tr><td>${esc(k)}</td><td class="num">${v.n}</td><td class="num">${v.default.toFixed(0)}%</td><td class="num">${v.before.toFixed(0)}%</td><td class="num">${v.after.toFixed(1)}%</td></tr>`).join("");
 }
 
 // ---------- nav ----------

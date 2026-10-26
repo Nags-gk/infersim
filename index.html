@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InferSim</title>
+<meta name="description" content="LLM inference performance model for GPU, LPU and heterogeneous systems: roofline analysis, design space exploration and serving simulation, running live in the browser.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap top-inner">
+    <div>
+      <h1>InferSim</h1>
+      <p class="lede">A performance model for LLM inference on GPUs, LPUs and heterogeneous systems. Roofline per operator, design space sweeps, and a continuous-batching serving simulator. The Python package runs live in this page.</p>
+    </div>
+    <div class="top-meta">
+      <span id="engine" class="pill pill-wait">Python engine loading</span>
+      <a class="link" href="https://github.com/Nags-gk/infersim">Source on GitHub</a>
+    </div>
+  </div>
+  <nav class="wrap tabs" id="nav">
+    <a href="#findings">Findings</a>
+    <a href="#step">Step explorer</a>
+    <a href="#dse">Design space</a>
+    <a href="#serve">Serving</a>
+    <a href="#method">Method</a>
+  </nav>
+</header>
+
+<main class="wrap">
+  <section id="findings">
+    <h2>What the model says</h2>
+    <div id="finding-cards" class="cards"></div>
+  </section>
+
+  <section id="step">
+    <h2>Step explorer</h2>
+    <p class="hint">One forward pass, broken into operators and placed on the hardware roofline. Change anything; the model recomputes in your browser.</p>
+    <div class="explorer">
+      <form id="step-form" class="controls">
+        <label>Model <select name="model"></select></label>
+        <label>Hardware <select name="hw"></select></label>
+        <div class="row2">
+          <label>TP <select name="tp"><option>1</option><option>2</option><option>4</option><option>8</option></select></label>
+          <label>PP <select name="pp"><option>1</option><option>2</option><option>4</option></select></label>
+        </div>
+        <label>Precision <select name="precision"><option>bf16</option><option>fp8</option><option>fp4</option></select></label>
+        <label>Phase <select name="phase"><option value="decode">decode</option><option value="prefill">prefill</option></select></label>
+        <div class="row2">
+          <label>Batch <input name="batch" type="number" min="1" max="4096" value="1"></label>
+          <label><span id="tok-label">Context</span> <input name="tokens" type="number" min="1" max="131072" value="2048"></label>
+        </div>
+        <label class="check"><input type="checkbox" name="ep"> Expert parallel (MoE)</label>
+        <button type="submit" id="step-run" disabled>Compute</button>
+        <p class="status" id="step-status"></p>
+      </form>
+      <div class="results">
+        <div class="kpis" id="step-kpis"></div>
+        <div class="panel">
+          <div class="panel-head"><h3>Roofline</h3><span class="legend" id="roof-legend"></span></div>
+          <div id="roof-chart" class="chart"></div>
+          <p class="note">Each dot is one operator, at its arithmetic intensity and the FLOP/s it achieves (including launch overhead). Dot area is its share of step time. Ops below the slanted roof are memory-bound.</p>
+        </div>
+        <div class="split">
+          <div class="panel"><h3>Where time goes</h3><div id="step-bars"></div></div>
+          <div class="panel"><h3>Slowest operators</h3><table class="tbl" id="step-top"></table></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="dse">
+    <h2>Design space</h2>
+    <p class="hint">Every layout the sweep could fit, at decode batch 1 to 512, for 2,048-token prompts and 256-token answers. Up and right is better: interactivity per user against throughput per device.</p>
+    <div class="seg" id="dse-models"></div>
+    <div class="panel">
+      <div class="panel-head"><h3>Pareto frontier</h3><span class="legend" id="dse-legend"></span></div>
+      <div id="dse-chart" class="chart tall"></div>
+    </div>
+    <div class="sla">
+      <label for="sla">Minimum tokens/s per user: <strong id="sla-val">50</strong></label>
+      <input id="sla" type="range" min="0" max="4" step="1" value="1">
+      <p id="sla-best" class="callout"></p>
+    </div>
+    <div class="panel"><h3>Frontier points</h3><div class="scroll"><table class="tbl" id="dse-table"></table></div></div>
+  </section>
+
+  <section id="serve">
+    <h2>Serving simulation</h2>
+    <p class="hint">A discrete-event simulator with continuous batching and chunked prefill, driven by Poisson arrivals. The curve below is Llama-3.1-8B on one H100 as load rises.</p>
+    <div class="panel"><h3>Load sweep: Llama-3.1-8B, 1x H100, 1,024 in / 256 out</h3><div id="serve-curve" class="chart"></div></div>
+    <form id="serve-form" class="controls inline">
+      <label>Model <select name="model"></select></label>
+      <label>Hardware <select name="hw"></select></label>
+      <label>TP <select name="tp"><option>1</option><option>2</option><option>4</option><option>8</option></select></label>
+      <label>Precision <select name="precision"><option>bf16</option><option>fp8</option></select></label>
+      <label>Requests/s <input name="rate" type="number" step="any" min="0.1" value="8"></label>
+      <label>Requests <input name="requests" type="number" min="10" max="2000" value="200"></label>
+      <label>Prompt <input name="prompt" type="number" min="1" value="1024"></label>
+      <label>Output <input name="output" type="number" min="2" value="256"></label>
+      <button type="submit" id="serve-run" disabled>Simulate</button>
+    </form>
+    <p class="status" id="serve-status"></p>
+    <div class="kpis" id="serve-kpis"></div>
+    <div class="panel" id="serve-hist-panel" hidden><h3>Time to first token, per request</h3><div id="serve-hist" class="chart short"></div></div>
+  </section>
+
+  <section id="method">
+    <h2>Method and assumptions</h2>
+    <div class="prose">
+      <p><strong>Operators.</strong> Each layer is mapped to GEMMs with (M, N, K) per tensor-parallel rank, plus attention, elementwise work and collectives. FLOPs and bytes give arithmetic intensity; time is the larger of compute (tile-padded FLOPs at achievable peak) and memory traffic (bytes at achievable bandwidth), plus a fixed launch cost. Collectives use an alpha-beta model, taking the faster of ring and one-shot all-reduce.</p>
+      <p><strong>Architectures.</strong> Loaded from Hugging Face <code>config.json</code>: dense GQA (Llama, Qwen), mixture of experts (Mixtral, DeepSeek-V3, with expected active experts per batch), and DeepSeek's multi-head latent attention (weight-absorbed decode over the 576-dim latent). Parameter counts are tested against published sizes.</p>
+      <p><strong>LPU.</strong> All weights live in on-chip SRAM across many chips, executed as a chip-to-chip pipeline. An op larger than one chip's SRAM is split across chips and all-reduced. KV cache must also fit on chip.</p>
+      <p><strong>Heterogeneous.</strong> Disaggregated serving (prefill on GPUs, decode on LPUs, KV cache shipped over a 400 Gb/s link), and an attention-FFN split (attention and KV on GPUs, FFN weights on LPUs, activations crossing twice per layer). Both are labeled speculative.</p>
+      <p><strong>Validation status.</strong> Unit and property tests check invariants (no op beats its roofline, latency is monotonic in batch, Pareto points are non-dominated, calibration recovers known parameters). Calibration against real GPU measurements is the next milestone; until then, treat absolute latencies as estimates and comparisons as the point.</p>
+    </div>
+    <div class="panel"><h3>Hardware catalog</h3><div class="scroll"><table class="tbl" id="hw-table"></table></div></div>
+  </section>
+</main>
+
+<footer class="wrap foot">
+  <span>InferSim <span id="ver"></span>. MIT licensed. Numbers are modeled unless labeled measured.</span>
+  <a class="link" href="https://github.com/Nags-gk/infersim">github.com/Nags-gk/infersim</a>
+</footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

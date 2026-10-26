@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "infersim"
+version = "0.1.0"
+description = "LLM inference performance model for GPU, LPU and heterogeneous systems: roofline, serving simulation, design space exploration, calibration"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "hypothesis>=6", "ruff>=0.6"]
+
+[project.scripts]
+infersim = "infersim.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["infersim*"]
+
+[tool.setuptools.package-data]
+infersim = ["data/*.json"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

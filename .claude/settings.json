@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -m pytest -q -x tests/test_catalog.py tests/test_models.py tests/test_roofline.py >&2 || exit 2",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}

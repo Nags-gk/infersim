@@ -60,13 +60,13 @@ CATALOG: dict[str, HardwareSpec] = {
     "t4": HardwareSpec(
         name="NVIDIA T4",
         kind="gpu",
-        peak_flops={"fp16": 65 * T, "int8": 130 * T},
+        peak_flops={"fp16": 65 * T, "int8": 130 * T, "fp32": 8.1 * T},
         mem_bw=320 * GB,
         mem_capacity=16 * GB,
         link_bw=16 * GB,  # PCIe Gen3 x16, no NVLink
         link_latency=10e-6,
         launch_overhead=5e-6,
-        sources=("NVIDIA T4 Tensor Core GPU datasheet: 65 FP16 TFLOPS, 320 GB/s GDDR6, 16 GB",),
+        sources=("NVIDIA T4 Tensor Core GPU datasheet: 65 FP16 TFLOPS (mixed precision), 8.1 FP32 TFLOPS, 320 GB/s GDDR6, 16 GB",),
         assumptions=("No bf16 on Turing: bf16 work runs at the fp16 rate",),
     ),
     "a100": HardwareSpec(

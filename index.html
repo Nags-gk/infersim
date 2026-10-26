@@ -26,6 +26,7 @@
     <a href="#step">Step explorer</a>
     <a href="#dse">Design space</a>
     <a href="#serve">Serving</a>
+    <a href="#validate">Validation</a>
     <a href="#method">Method</a>
   </nav>
 </header>
@@ -108,6 +109,12 @@
     <div class="panel" id="serve-hist-panel" hidden><h3>Time to first token, per request</h3><div id="serve-hist" class="chart short"></div></div>
   </section>
 
+  <section id="validate">
+    <h2>Validation on a real GPU</h2>
+    <p class="hint">Measured on a Colab T4 with PyTorch and Hugging Face transformers, then compared with the model. Every fourth measurement is held out of the fit.</p>
+    <div id="val-body"><div class="panel"><p class="note" id="val-pending">Loading...</p></div></div>
+  </section>
+
   <section id="method">
     <h2>Method and assumptions</h2>
     <div class="prose">
@@ -115,7 +122,7 @@
       <p><strong>Architectures.</strong> Loaded from Hugging Face <code>config.json</code>: dense GQA (Llama, Qwen), mixture of experts (Mixtral, DeepSeek-V3, with expected active experts per batch), and DeepSeek's multi-head latent attention (weight-absorbed decode over the 576-dim latent). Parameter counts are tested against published sizes.</p>
       <p><strong>LPU.</strong> All weights live in on-chip SRAM across many chips, executed as a chip-to-chip pipeline. An op larger than one chip's SRAM is split across chips and all-reduced. KV cache must also fit on chip.</p>
       <p><strong>Heterogeneous.</strong> Disaggregated serving (prefill on GPUs, decode on LPUs, KV cache shipped over a 400 Gb/s link), and an attention-FFN split (attention and KV on GPUs, FFN weights on LPUs, activations crossing twice per layer). Both are labeled speculative.</p>
-      <p><strong>Validation status.</strong> Unit and property tests check invariants (no op beats its roofline, latency is monotonic in batch, Pareto points are non-dominated, calibration recovers known parameters). Calibration against real GPU measurements is the next milestone; until then, treat absolute latencies as estimates and comparisons as the point.</p>
+      <p><strong>Validation status.</strong> Unit and property tests check invariants (no op beats its roofline, latency is monotonic in batch, Pareto points are non-dominated, calibration recovers known parameters). The Validation section compares predictions with real GPU measurements; where no measurement exists, treat absolute latencies as estimates and comparisons as the point.</p>
     </div>
     <div class="panel"><h3>Hardware catalog</h3><div class="scroll"><table class="tbl" id="hw-table"></table></div></div>
   </section>
